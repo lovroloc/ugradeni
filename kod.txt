@@ -1,0 +1,459 @@
+//FINALNA VERZIJA WEATHER ASSISTANT-A
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <ESP32Servo.h>
+#include <SD.h>
+
+// WiFi podaci
+const char* ssid = "Optima-756fe8";
+const char* password = "OPTIMA2901503445";
+
+// OpenWeatherMap API
+const String apiKey = "dddacd858742af40eae1b879b24adc39";
+const String city = "Osijek";
+const String country = "HR";
+const String weatherURL = "http://api.openweathermap.org/data/2.5/weather?q=" + city + "," + country + "&appid=" + apiKey + "&units=metric";
+
+// Definicije pinova
+#define TFT_CS    5
+#define TFT_DC    16
+#define TFT_RST   17
+#define TFT_MOSI  23
+#define TFT_CLK   18
+#define TFT_MISO  19
+#define SD_CS     4
+#define BUZZER    25
+#define SERVO_PIN 26
+
+// Boje
+#define BLACK   0x0000
+#define WHITE   0xFFFF
+#define RED     0xF800
+#define GREEN   0x07E0
+#define BLUE    0x001F
+#define YELLOW  0xFFE0
+#define CYAN    0x07FF
+#define MAGENTA 0xF81F
+#define ORANGE  0xFD20
+#define DARKGRAY 0x7BEF
+
+// Struktura podataka o vremenu
+struct Weather {
+  float temperature;
+  float humidity;
+  String description;
+  String condition;
+  float windSpeed;
+  float pressure;
+  bool valid;
+  unsigned long lastUpdate;
+};
+
+struct ForecastWeather {
+  float temperature;
+  String condition;
+  bool valid;
+};
+
+ForecastWeather forecast5h;
+
+// Globalni objekti
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+Servo weatherServo;
+Weather currentWeather;
+
+// Varijable stanja
+bool wifiConnected = false;
+bool sdAvailable = false;
+unsigned long lastWeatherUpdate = 0;
+unsigned long lastDisplayUpdate = 0;
+const unsigned long weatherUpdateInterval = 600000; // 10 minuta
+const unsigned long displayUpdateInterval = 30000;  // 30 sekundi
+String forecastURL = "http://api.openweathermap.org/data/2.5/forecast?q=" + city + "," + country + "&appid=" + apiKey + "&units=metric";
+
+// Funkcija za inicijalizaciju SD kartice
+void initializeSD() {
+  digitalWrite(TFT_CS, HIGH);
+  delay(100);
+  
+  if (SD.begin(SD_CS, SPI, 4000000)) {
+    sdAvailable = true;
+  } else if (SD.begin(SD_CS, SPI, 1000000)) {
+    sdAvailable = true;
+  } else if (SD.begin(SD_CS, SPI, 400000)) {
+    sdAvailable = true;
+  } else {
+    sdAvailable = false;
+  }
+}
+
+// Funkcija za dobivanje imena character sprite-a
+String getCharacterSprite(String condition, float temperature) {
+  if (condition == "Clear" && temperature > 25) {
+    return "/characters/summer_girl.bmp";
+  } else if (condition == "Clear" && temperature > 15) {
+    return "/characters/spring_girl.bmp";
+  } else if (condition == "Rain" || condition == "Drizzle") {
+    return "/characters/rain_girl.bmp";
+  } else if (condition == "Snow" || temperature < 0) {
+    return "/characters/winter_girl.bmp";
+  } else if (condition == "Thunderstorm") {
+    return "/characters/storm_girl.bmp";
+  } else if (condition == "Clouds") {
+    return "/characters/cloudy_girl.bmp";
+  } else {
+    return "/characters/default_girl.bmp";
+  }
+}
+
+bool displayCharacterSprite(const char* filename, int16_t x, int16_t y) {
+  File bmpFile = SD.open(filename);
+  if (!bmpFile) return false;
+  
+  uint8_t header[54];
+  bmpFile.read(header, 54);
+  
+  if (header[0] != 'B' || header[1] != 'M') {
+    bmpFile.close();
+    return false;
+  }
+  
+  uint32_t dataOffset = *(uint32_t*)&header[10];
+  uint32_t width = *(uint32_t*)&header[18];
+  uint32_t height = *(uint32_t*)&header[22];
+  
+  bmpFile.seek(dataOffset);
+  uint32_t rowSize = (width * 3 + 3) & ~3;
+  uint8_t* buffer = (uint8_t*)malloc(rowSize);
+  
+  for (int32_t row = height - 1; row >= 0; row--) {
+    bmpFile.seek(dataOffset + (row * rowSize));
+    bmpFile.read(buffer, rowSize);
+    
+    for (uint32_t col = 0; col < width; col++) {
+      uint8_t b = buffer[col * 3];
+      uint8_t g = buffer[col * 3 + 1];
+      uint8_t r = buffer[col * 3 + 2];
+      
+      uint16_t color = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+      tft.drawPixel(x + col, y + (height - 1 - row), color);
+    }
+    
+    if (row % 20 == 0) yield();
+  }
+  
+  free(buffer);
+  bmpFile.close();
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Inicijaliziraj display
+  tft.begin();
+  tft.setRotation(0);
+  tft.fillScreen(BLACK);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 50);
+  tft.println("VREMENSKI");
+  tft.setCursor(10, 80);
+  tft.println("ASISTENT");
+
+  // Inicijaliziraj SD karticu
+  initializeSD();
+  
+  // Inicijaliziraj servo
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  weatherServo.setPeriodHertz(50);
+  weatherServo.attach(SERVO_PIN, 1000, 2000);
+  weatherServo.write(90);
+  
+  // Inicijaliziraj buzzer
+  pinMode(BUZZER, OUTPUT);
+  playStartupMelody();
+  
+  // Spoji se na WiFi
+  WiFi.begin(ssid, password);
+  tft.setCursor(10, 140);
+  tft.setTextColor(YELLOW);
+  tft.println("Spajanje na WiFi...");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    tft.setCursor(10, 140);
+    tft.setTextColor(GREEN);
+    tft.println("WiFi: Spojen      ");
+  } else {
+    wifiConnected = false;
+    tft.setCursor(10, 140);
+    tft.setTextColor(RED);
+    tft.println("WiFi: Neuspješan  ");
+  }
+  
+  // Dohvati početno vrijeme
+  if (wifiConnected) {
+    fetchWeatherData();
+    fetchForecastData();
+  } else {
+    currentWeather.temperature = 22.5;
+    currentWeather.condition = "Clear";
+    currentWeather.description = "vedro nebo";
+    currentWeather.humidity = 65;
+    currentWeather.windSpeed = 3.2;
+    currentWeather.valid = true;
+  }
+  
+  updateServoPosition();
+  delay(3000);
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Provjeri WiFi vezu
+  if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+    wifiConnected = false;
+  }
+  
+  // Ažuriraj vrijeme svakih 10 minuta
+  if (currentTime - lastWeatherUpdate >= weatherUpdateInterval) {
+    if (wifiConnected) {
+      fetchWeatherData();
+      fetchForecastData();
+    } else {
+      generateSimulatedWeather();
+      forecast5h.temperature = currentWeather.temperature + random(-5, 5);
+      forecast5h.condition = currentWeather.condition;
+      forecast5h.valid = true;
+    }
+    updateServoPosition();
+    playWeatherMelody();
+    lastWeatherUpdate = currentTime;
+  }
+  
+  // Ažuriraj display svakih 30 sekundi
+  if (currentTime - lastDisplayUpdate >= displayUpdateInterval) {
+    updateDisplay();
+    lastDisplayUpdate = currentTime;
+  }
+  
+  delay(1000);
+}
+
+void fetchWeatherData() {
+  if (!wifiConnected) return;
+  
+  HTTPClient http;
+  http.begin(weatherURL);
+  
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+    parseWeatherData(payload);
+  }
+  http.end();
+}
+
+void parseWeatherData(String jsonString) {
+  DynamicJsonDocument doc(1024);
+  deserializeJson(doc, jsonString);
+  
+  currentWeather.temperature = doc["main"]["temp"];
+  currentWeather.humidity = doc["main"]["humidity"];
+  currentWeather.pressure = doc["main"]["pressure"];
+  currentWeather.windSpeed = doc["wind"]["speed"];
+  currentWeather.condition = doc["weather"][0]["main"].as<String>();
+  currentWeather.description = doc["weather"][0]["description"].as<String>();
+  currentWeather.valid = true;
+  currentWeather.lastUpdate = millis();
+}
+
+void fetchForecastData() {
+  if (!wifiConnected) {
+    forecast5h.valid = false;
+    return;
+  }
+  
+  HTTPClient http;
+  http.begin(forecastURL);
+  
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    String payload = http.getString();
+    parseForecastData(payload);
+  } else {
+    forecast5h.valid = false;
+  }
+  http.end();
+}
+
+void parseForecastData(String jsonString) {
+  DynamicJsonDocument doc(4096);
+  DeserializationError error = deserializeJson(doc, jsonString);
+  
+  if (error) {
+    forecast5h.valid = false;
+    return;
+  }
+  
+  if (doc["list"][1]) {
+    forecast5h.temperature = doc["list"][1]["main"]["temp"];
+    forecast5h.condition = doc["list"][1]["weather"][0]["main"].as<String>();
+    forecast5h.valid = true;
+  } else {
+    forecast5h.valid = false;
+  }
+}
+
+void generateSimulatedWeather() {
+  currentWeather.temperature = random(-5, 35);
+  currentWeather.humidity = random(30, 90);
+  currentWeather.pressure = random(990, 1030);
+  currentWeather.windSpeed = random(0, 15);
+  
+  String conditions[] = {"Clear", "Clouds", "Rain", "Drizzle", "Snow", "Thunderstorm"};
+  String descriptions[] = {"vedro nebo", "nekoliko oblaka", "lagana kiša", "jaka kiša", "snijeg", "grmljavina"};
+  
+  int index = random(0, 6);
+  currentWeather.condition = conditions[index];
+  currentWeather.description = descriptions[index];
+  currentWeather.valid = true;
+  currentWeather.lastUpdate = millis();
+}
+
+void updateDisplay() {
+  tft.fillScreen(WHITE);
+  
+  // Šareni okvir (5 pixela debljine)
+  tft.drawRect(0, 0, 240, 320, BLUE);
+  tft.drawRect(1, 1, 238, 318, GREEN);
+  tft.drawRect(2, 2, 236, 316, ORANGE);
+  tft.drawRect(3, 3, 234, 314, MAGENTA);
+  tft.drawRect(4, 4, 232, 312, CYAN);
+  
+  if (currentWeather.valid) {
+    tft.drawFastVLine(60, 10, 50, BLACK);
+    tft.drawFastVLine(120, 10, 50, BLACK);
+    tft.drawFastVLine(180, 10, 50, BLACK);
+    
+    // trenutna ikona vremena
+    String currentIcon = "/icons/";
+    String condition = currentWeather.condition;
+    condition.toLowerCase();
+    currentIcon += condition + ".bmp";
+    displayCharacterSprite(currentIcon.c_str(), 20, 20);
+    
+    // trenutna temperatura
+    tft.setTextSize(2);
+    tft.setTextColor(BLACK);
+    tft.setCursor(70, 30);
+    tft.printf("%.0fC", currentWeather.temperature);
+    
+    // buduca ikona vremena
+    if (forecast5h.valid) {
+      String forecastIcon = "/icons/";
+      String forecastCondition = forecast5h.condition;
+      forecastCondition.toLowerCase();
+      forecastIcon += forecastCondition + ".bmp";
+      displayCharacterSprite(forecastIcon.c_str(), 130, 20);
+    } else {
+      tft.setTextSize(2);
+      tft.setTextColor(RED);
+      tft.setCursor(130, 30);
+      tft.println("?");
+    }
+    
+    // buduca temperatura
+    tft.setTextSize(2);
+    tft.setTextColor(BLACK);
+    tft.setCursor(190, 30);
+    if (forecast5h.valid) {
+      tft.printf("%.0fC", forecast5h.temperature);
+    } else {
+      tft.setTextColor(RED);
+      tft.println("??C");
+    }
+    
+    // Vodoravni separator
+    tft.drawFastHLine(7, 65, 226, BLACK);
+    
+    // Character sprite
+    String spriteFile = getCharacterSprite(currentWeather.condition, currentWeather.temperature);
+    displayCharacterSprite(spriteFile.c_str(), 68, 100);
+  }
+}
+
+void updateServoPosition() {
+  int angle = 90;
+  
+  if (currentWeather.condition == "Clear") {
+    angle = 30;
+  } else if (currentWeather.condition == "Rain" || currentWeather.condition == "Drizzle") {
+    angle = 150;
+  } else if (currentWeather.condition == "Clouds") {
+    angle = 90;
+  } else if (currentWeather.condition == "Snow") {
+    angle = 60;
+  } else if (currentWeather.condition == "Thunderstorm") {
+    angle = 120;
+  }
+  
+  weatherServo.write(angle);
+}
+
+void playWeatherMelody() {
+  if (currentWeather.condition == "Clear" || currentWeather.temperature > 20) {
+    int melody[] = {262, 294, 330, 349, 392, 440, 494, 523};
+    for (int i = 0; i < 8; i++) {
+      playTone(BUZZER, melody[i], 200);
+    }
+  } 
+  else if (currentWeather.condition == "Rain" || currentWeather.condition == "Drizzle") {
+    int melody[] = {523, 494, 440, 392, 349, 330, 294, 262};
+    for (int i = 0; i < 8; i++) {
+      playTone(BUZZER, melody[i], 300);
+    }
+  }
+  else if (currentWeather.condition == "Thunderstorm") {
+    int melody[] = {196, 220, 196, 220, 262, 220, 196};
+    for (int i = 0; i < 7; i++) {
+      playTone(BUZZER, melody[i], 150);
+    }
+  }
+  else {
+    int melody[] = {330, 392, 330, 392, 440, 392, 330};
+    for (int i = 0; i < 7; i++) {
+      playTone(BUZZER, melody[i], 250);
+    }
+  }
+}
+
+void playStartupMelody() {
+  int melody[] = {262, 330, 392, 523, 523, 392, 330, 262};
+  for (int i = 0; i < 8; i++) {
+    playTone(BUZZER, melody[i], 150);
+  }
+}
+
+void playTone(int pin, int frequency, int duration) {
+  tone(pin, frequency, duration);
+  delay(duration + 50);
+  noTone(pin);
+}
